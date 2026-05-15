@@ -73,7 +73,7 @@ function hashDeviceFingerprint(fp) {
 // ========== Netlify Handler ==========
 exports.handler = async (event, context) => {
     const method = event.httpMethod;
-    const path = event.path.replace('/api', '') || '/';
+    const path = event.path; // /.netlify/functions/api/status 或 /api/status
     
     // CORS headers
     const headers = {
@@ -96,7 +96,7 @@ exports.handler = async (event, context) => {
     }
     
     // ---- GET /api/status ----
-    if (method === 'GET' && path === '/status') {
+    if (method === 'GET' && path.endsWith('/status')) {
         return {
             statusCode: 200,
             headers,
@@ -109,7 +109,7 @@ exports.handler = async (event, context) => {
     }
     
     // ---- POST /api/activate ----
-    if (method === 'POST' && path === '/activate') {
+    if (method === 'POST' && path.endsWith('/activate')) {
         if (!SECRET) {
             return { statusCode: 500, headers, body: JSON.stringify({ code: 500, message: '服务器未配置 SECRET' }) };
         }
@@ -157,7 +157,7 @@ exports.handler = async (event, context) => {
     }
     
     // ---- POST /api/check ----
-    if (method === 'POST' && path === '/check') {
+    if (method === 'POST' && path.endsWith('/check')) {
         if (!SECRET) {
             return { statusCode: 500, headers, body: JSON.stringify({ code: 500, message: '服务器未配置 SECRET' }) };
         }
