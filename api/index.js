@@ -11,8 +11,8 @@
 const crypto = require('crypto');
 
 const SECRET = process.env.SECRET;
-const UPSTASH_URL = process.env.UPSTASH_URL;
-const UPSTASH_TOKEN = process.env.UPSTASH_TOKEN;
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
 const VERSION = 0x01;
 const PRODUCT_ID = [0xC6, 0x25];
 
