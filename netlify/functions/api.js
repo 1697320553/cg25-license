@@ -176,7 +176,7 @@ exports.handler = async (event, context) => {
             }
         }
         
-        const newBind = JSON.stringify({ deviceHash, hwFp, status: 'active' });
+        const newBind = JSON.stringify({ deviceHash, hwFp, status: 'active', createdAt: new Date().toISOString() });
         await redisSet(`bind:${normalizedKey}`, newBind);
         await redisSet(`device:${deviceHash}`, normalizedKey);
         if (hwFp) await redisSet(`hwfp:${hwFp}`, deviceHash);
@@ -351,7 +351,9 @@ exports.handler = async (event, context) => {
             statusCode: 200, headers,
             body: JSON.stringify({
                 code: 200,
+                cardKey: cleaned,
                 status: bindData.status || 'active',
+                createdAt: bindData.createdAt || null,
                 deviceHash: bindData.deviceHash ? bindData.deviceHash.substring(0, 16) + '...' : null,
                 hasHwFp: !!bindData.hwFp
             })

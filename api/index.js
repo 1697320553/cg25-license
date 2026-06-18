@@ -157,7 +157,7 @@ module.exports = async (req, res) => {
         }
         
         // 新激活
-        const newBind = JSON.stringify({ deviceHash, hwFp, status: 'active' });
+        const newBind = JSON.stringify({ deviceHash, hwFp, status: 'active', createdAt: new Date().toISOString() });
         await redisSet(`bind:${normalizedKey}`, newBind);
         await redisSet(`device:${deviceHash}`, normalizedKey);
         if (hwFp) await redisSet(`hwfp:${hwFp}`, deviceHash);
@@ -302,7 +302,9 @@ module.exports = async (req, res) => {
         const bindData = parseBindData(raw);
         return res.status(200).json({
             code: 200,
+            cardKey: cleaned,
             status: bindData.status || 'active',
+            createdAt: bindData.createdAt || null,
             deviceHash: bindData.deviceHash ? bindData.deviceHash.substring(0, 16) + '...' : null,
             hasHwFp: !!bindData.hwFp
         });
