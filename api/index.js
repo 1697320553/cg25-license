@@ -1,11 +1,14 @@
 /**
- * license-server-vercel.js v2
+ * license-server-vercel.js v3
  * 
- * 卡密验证服务器 - 纯算法验证（不需要存储卡密列表）
- * 绑定数据存储在 Upstash Redis（免费，无需信用卡）
- * 环境变量只需要 3 个：SECRET、UPSTASH_URL、UPSTASH_TOKEN
+ * v3 更新：
+ * - 硬件指纹（hwFingerprint）支持浏览器重装后恢复绑定
+ * - 吊销功能（/revoke）管理员一键禁用卡密
+ * - bind:* 存储 JSON 格式，支持 status 字段
+ * - 修复 redisSet 缺失 body 的 bug
  * 
  * 部署位置：GitHub 仓库的 api/index.js
+ * 新增环境变量：ADMIN_KEY（管理密钥，用于吊销卡密）
  */
 
 const crypto = require('crypto');
@@ -13,23 +16,37 @@ const crypto = require('crypto');
 const SECRET = process.env.SECRET;
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
 const VERSION = 0x01;
 const PRODUCT_ID = [0xC6, 0x25];
 
-// ========== Upstash Redis 操作（纯 fetch，不需要任何 npm 包）==========
+// ========== Upstash Redis 操作 ==========
 async function redisGet(key) {
     const res = await fetch(`${UPSTASH_URL}/get/${key}`, {
         headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
     });
     const data = await res.json();
-    return data.result;  // Upstash 返回字符串
+    return data.result;
 }
 
 async function redisSet(key, value) {
     await fetch(`${UPSTASH_URL}/set/${key}`, {
         method: 'POST',
+        headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+        body: value
+    });
+}
+
+async function redisDel(key) {
+    await fetch(`${UPSTASH_URL}/del/${key}`, {
+        method: 'POST',
         headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
     });
+}
+
+// ========== 哈希 ==========
+function hashId(id) {
+    return crypto.createHash('sha256').update(id + '||salt').digest('hex');
 }
 
 // ========== 卡密验证 ==========
@@ -66,9 +83,17 @@ function verifyKey(keyStr) {
     return { valid: true, hex: cleaned };
 }
 
-// ========== 设备指纹哈希 ==========
-function hashDeviceFingerprint(fp) {
-    return crypto.createHash('sha256').update(fp + '||salt').digest('hex');
+// ========== 解析 bind 数据（兼容旧格式）==========
+function parseBindData(raw) {
+    if (!raw) return null;
+    try {
+        var d = JSON.parse(raw);
+        // 兼容旧格式：纯字符串 → 当做 deviceHash
+        if (typeof d === 'string') return { deviceHash: d, hwFp: null, status: 'active' };
+        return d;
+    } catch(e) {
+        return { deviceHash: raw, hwFp: null, status: 'active' };
+    }
 }
 
 // ========== Vercel Serverless Handler ==========
@@ -87,6 +112,7 @@ module.exports = async (req, res) => {
             status: 'running',
             redis: !!UPSTASH_URL,
             secret: !!SECRET,
+            adminKey: !!ADMIN_KEY
         });
     }
     
@@ -95,27 +121,46 @@ module.exports = async (req, res) => {
         if (!SECRET) return res.status(500).json({ code: 500, message: '服务器未配置 SECRET' });
         if (!UPSTASH_URL) return res.status(500).json({ code: 500, message: '服务器未配置 Redis' });
         
-        const { key, deviceId } = req.body || {};
+        const { key, deviceId, hwFingerprint } = req.body || {};
         if (!key || !deviceId) return res.status(400).json({ code: 400, message: '缺少参数' });
         
         const verifyResult = verifyKey(key);
         if (!verifyResult.valid) return res.status(400).json({ code: 400, message: verifyResult.reason });
         
-        const deviceHash = hashDeviceFingerprint(deviceId);
+        const deviceHash = hashId(deviceId);
+        const hwFp = hwFingerprint ? hashId(hwFingerprint) : null;
         const normalizedKey = verifyResult.hex;
         
-        const boundDevice = await redisGet(`bind:${normalizedKey}`);
+        const raw = await redisGet(`bind:${normalizedKey}`);
+        const bindData = parseBindData(raw);
         
-        if (boundDevice && boundDevice !== deviceHash) {
-            return res.status(403).json({ code: 403, message: '此卡密已在其他设备上激活' });
+        if (bindData) {
+            if (bindData.status === 'revoked') {
+                return res.status(403).json({ code: 403, message: '该卡密已被禁用' });
+            }
+            if (bindData.deviceHash !== deviceHash) {
+                // v2→v3 迁移：旧格式无 hwFp，允许更新绑定
+                if (!bindData.hwFp && hwFp) {
+                    await redisDel(`device:${bindData.deviceHash}`);
+                } else {
+                    return res.status(403).json({ code: 403, message: '此卡密已在其他设备上激活' });
+                }
+            } else {
+                // 同一设备重复激活 → 补充 hwFp（旧激活没有）
+                if (!bindData.hwFp && hwFp) {
+                    bindData.hwFp = hwFp;
+                    await redisSet(`bind:${normalizedKey}`, JSON.stringify(bindData));
+                    await redisSet(`hwfp:${hwFp}`, deviceHash);
+                }
+                return res.status(200).json({ code: 200, message: '已激活', status: 'already_activated' });
+            }
         }
         
-        if (boundDevice === deviceHash) {
-            return res.status(200).json({ code: 200, message: '已激活', status: 'already_activated' });
-        }
-        
-        await redisSet(`bind:${normalizedKey}`, deviceHash);
+        // 新激活
+        const newBind = JSON.stringify({ deviceHash, hwFp, status: 'active' });
+        await redisSet(`bind:${normalizedKey}`, newBind);
         await redisSet(`device:${deviceHash}`, normalizedKey);
+        if (hwFp) await redisSet(`hwfp:${hwFp}`, deviceHash);
         
         console.log(`[激活] ${normalizedKey.slice(0, 12)}... → ${deviceHash.slice(0, 16)}...`);
         return res.status(200).json({ code: 200, message: '激活成功', status: 'activated' });
@@ -126,14 +171,68 @@ module.exports = async (req, res) => {
         if (!SECRET) return res.status(500).json({ code: 500, message: '服务器未配置 SECRET' });
         if (!UPSTASH_URL) return res.status(500).json({ code: 500, message: '服务器未配置 Redis' });
         
-        const { deviceId } = req.body || {};
+        const { deviceId, hwFingerprint } = req.body || {};
         if (!deviceId) return res.status(400).json({ code: 400, message: '缺少参数' });
         
-        const deviceHash = hashDeviceFingerprint(deviceId);
-        const boundKey = await redisGet(`device:${deviceHash}`);
+        let deviceHash = hashId(deviceId);
+        let boundKey = await redisGet(`device:${deviceHash}`);
+        let recovered = false;
         
-        if (boundKey) return res.status(200).json({ code: 200, message: '已激活', status: 'active' });
+        // 恢复路径：UUID 丢了，用硬件指纹找回
+        if (!boundKey && hwFingerprint) {
+            const hwFp = hashId(hwFingerprint);
+            const recoveredHash = await redisGet(`hwfp:${hwFp}`);
+            if (recoveredHash) {
+                deviceHash = recoveredHash;
+                boundKey = await redisGet(`device:${deviceHash}`);
+                recovered = true;
+            }
+        }
+        
+        if (boundKey) {
+            const raw = await redisGet(`bind:${boundKey}`);
+            const bindData = parseBindData(raw);
+            
+            if (bindData && bindData.status === 'revoked') {
+                return res.status(200).json({ code: 401, message: '卡密已被禁用', status: 'revoked' });
+            }
+            
+            return res.status(200).json({
+                code: 200,
+                message: '已激活',
+                status: 'active',
+                deviceHash,
+                recovered
+            });
+        }
+        
         return res.status(200).json({ code: 200, message: '未激活', status: 'inactive' });
+    }
+    
+    // ---- POST /api/revoke ----
+    if (req.method === 'POST' && url === '/api/revoke') {
+        if (!ADMIN_KEY) return res.status(500).json({ code: 500, message: '未配置 ADMIN_KEY' });
+        
+        const { adminKey, cardKey } = req.body || {};
+        if (!adminKey || !cardKey) return res.status(400).json({ code: 400, message: '缺少参数' });
+        if (adminKey !== ADMIN_KEY) return res.status(403).json({ code: 403, message: '管理密钥错误' });
+        
+        const cleaned = cardKey.replace(/[\s\-_]/g, '').toUpperCase();
+        const raw = await redisGet(`bind:${cleaned}`);
+        
+        if (!raw) return res.status(404).json({ code: 404, message: '未找到该卡密的绑定记录' });
+        
+        const bindData = parseBindData(raw);
+        
+        if (bindData.status === 'revoked') {
+            return res.status(200).json({ code: 200, message: '该卡密已被禁用', status: 'already_revoked' });
+        }
+        
+        bindData.status = 'revoked';
+        await redisSet(`bind:${cleaned}`, JSON.stringify(bindData));
+        
+        console.log(`[吊销] ${cleaned.slice(0, 12)}...`);
+        return res.status(200).json({ code: 200, message: '卡密已禁用', status: 'revoked' });
     }
     
     return res.status(404).json({ code: 404, message: 'Not Found' });
