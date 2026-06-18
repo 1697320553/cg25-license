@@ -264,5 +264,99 @@ exports.handler = async (event, context) => {
         return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '卡密已禁用', status: 'revoked' }) };
     }
     
+    // ---- POST /api/unbind ---- (删除绑定，卡密可重新激活到新设备)
+    if (method === 'POST' && path.endsWith('/unbind')) {
+        if (!ADMIN_KEY) {
+            return { statusCode: 500, headers, body: JSON.stringify({ code: 500, message: '未配置 ADMIN_KEY' }) };
+        }
+        
+        const { adminKey, cardKey } = body;
+        if (!adminKey || !cardKey) {
+            return { statusCode: 400, headers, body: JSON.stringify({ code: 400, message: '缺少参数' }) };
+        }
+        if (adminKey !== ADMIN_KEY) {
+            return { statusCode: 403, headers, body: JSON.stringify({ code: 403, message: '管理密钥错误' }) };
+        }
+        
+        const cleaned = cardKey.replace(/[\s\-_]/g, '').toUpperCase();
+        const raw = await redisGet(`bind:${cleaned}`);
+        
+        if (!raw) {
+            return { statusCode: 404, headers, body: JSON.stringify({ code: 404, message: '未找到该卡密的绑定记录' }) };
+        }
+        
+        const bindData = parseBindData(raw);
+        
+        // 删除 device 索引
+        if (bindData.deviceHash) await redisDel(`device:${bindData.deviceHash}`);
+        // 删除 hwfp 索引
+        if (bindData.hwFp) await redisDel(`hwfp:${bindData.hwFp}`);
+        // 删除 bind 记录
+        await redisDel(`bind:${cleaned}`);
+        
+        console.log(`[解绑] ${cleaned.slice(0, 12)}...`);
+        return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '卡密已解绑，可在新设备上重新激活' }) };
+    }
+    
+    // ---- POST /api/restore ---- (恢复已吊销的卡密)
+    if (method === 'POST' && path.endsWith('/restore')) {
+        if (!ADMIN_KEY) {
+            return { statusCode: 500, headers, body: JSON.stringify({ code: 500, message: '未配置 ADMIN_KEY' }) };
+        }
+        
+        const { adminKey, cardKey } = body;
+        if (!adminKey || !cardKey) {
+            return { statusCode: 400, headers, body: JSON.stringify({ code: 400, message: '缺少参数' }) };
+        }
+        if (adminKey !== ADMIN_KEY) {
+            return { statusCode: 403, headers, body: JSON.stringify({ code: 403, message: '管理密钥错误' }) };
+        }
+        
+        const cleaned = cardKey.replace(/[\s\-_]/g, '').toUpperCase();
+        const raw = await redisGet(`bind:${cleaned}`);
+        
+        if (!raw) {
+            return { statusCode: 404, headers, body: JSON.stringify({ code: 404, message: '未找到该卡密的绑定记录' }) };
+        }
+        
+        const bindData = parseBindData(raw);
+        
+        if (bindData.status !== 'revoked') {
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '该卡密未被吊销，无需恢复' }) };
+        }
+        
+        bindData.status = 'active';
+        await redisSet(`bind:${cleaned}`, JSON.stringify(bindData));
+        
+        console.log(`[恢复] ${cleaned.slice(0, 12)}...`);
+        return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '卡密已恢复，可正常使用' }) };
+    }
+    
+    // ---- POST /api/info ---- (查看卡密信息)
+    if (method === 'POST' && path.endsWith('/info')) {
+        const { cardKey } = body;
+        if (!cardKey) {
+            return { statusCode: 400, headers, body: JSON.stringify({ code: 400, message: '缺少卡密' }) };
+        }
+        
+        const cleaned = cardKey.replace(/[\s\-_]/g, '').toUpperCase();
+        const raw = await redisGet(`bind:${cleaned}`);
+        
+        if (!raw) {
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 200, status: 'unbound', message: '该卡密尚未激活' }) };
+        }
+        
+        const bindData = parseBindData(raw);
+        return {
+            statusCode: 200, headers,
+            body: JSON.stringify({
+                code: 200,
+                status: bindData.status || 'active',
+                deviceHash: bindData.deviceHash ? bindData.deviceHash.substring(0, 16) + '...' : null,
+                hasHwFp: !!bindData.hwFp
+            })
+        };
+    }
+    
     return { statusCode: 404, headers, body: JSON.stringify({ code: 404, message: 'Not Found' }) };
 };
