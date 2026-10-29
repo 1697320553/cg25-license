@@ -160,8 +160,11 @@ exports.handler = async (event, context) => {
             }
             if (bindData.deviceHash !== deviceHash) {
                 // v2→v3 迁移：旧格式无 hwFp，允许更新绑定
-                if (!bindData.hwFp && hwFp) {
+                // v3.3：同一硬件指纹允许迁移到新 deviceHash（用户清缓存/换浏览器后重新输卡密即可，不需管理员解绑）
+                const sameHw = !!(hwFp && bindData.hwFp && bindData.hwFp === hwFp);
+                if ((!bindData.hwFp && hwFp) || sameHw) {
                     await redisDel(`device:${bindData.deviceHash}`);
+                    if (bindData.hwFp) await redisDel(`hwfp:${bindData.hwFp}`);
                 } else {
                     return { statusCode: 403, headers, body: JSON.stringify({ code: 403, message: '此卡密已在其他设备上激活' }) };
                 }
@@ -199,35 +202,37 @@ exports.handler = async (event, context) => {
             return { statusCode: 400, headers, body: JSON.stringify({ code: 400, message: '缺少参数' }) };
         }
         
-        let deviceHash = hashId(deviceId);
-        let boundKey = await redisGet(`device:${deviceHash}`);
-        let recovered = false;
+        const deviceHash = hashId(deviceId);
+        const boundKey = await redisGet(`device:${deviceHash}`);
         
-        if (!boundKey && hwFingerprint) {
-            const hwFp = hashId(hwFingerprint);
-            const recoveredHash = await redisGet(`hwfp:${hwFp}`);
-            if (recoveredHash) {
-                deviceHash = recoveredHash;
-                boundKey = await redisGet(`device:${deviceHash}`);
-                recovered = true;
-            }
+        // v3.3 收紧：不再用 hwFingerprint 反查其他设备的绑定来"自动恢复"。
+        // 必须有本设备 deviceHash 的真实绑定，才允许返回 active。
+        if (!boundKey) {
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '未激活', status: 'inactive' }) };
         }
         
-        if (boundKey) {
-            const raw = await redisGet(`bind:${boundKey}`);
-            const bindData = parseBindData(raw);
-            
-            if (bindData && bindData.status === 'revoked') {
-                return { statusCode: 200, headers, body: JSON.stringify({ code: 401, message: '卡密已被禁用', status: 'revoked' }) };
-            }
-            
-            return {
-                statusCode: 200, headers,
-                body: JSON.stringify({ code: 200, message: '已激活', status: 'active', deviceHash, recovered })
-            };
+        const raw = await redisGet(`bind:${boundKey}`);
+        const bindData = parseBindData(raw);
+        
+        // 孤儿索引：bind 记录已被删除（如管理员解绑），清理索引并返回 inactive
+        if (!bindData) {
+            await redisDel(`device:${deviceHash}`);
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '未激活', status: 'inactive' }) };
         }
         
-        return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '未激活', status: 'inactive' }) };
+        if (bindData.status === 'revoked') {
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 401, message: '卡密已被禁用', status: 'revoked' }) };
+        }
+        
+        // 绑定记录里必须有指向本设备的 deviceHash
+        if (bindData.deviceHash && bindData.deviceHash !== deviceHash) {
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '未激活', status: 'inactive' }) };
+        }
+        
+        return {
+            statusCode: 200, headers,
+            body: JSON.stringify({ code: 200, message: '已激活', status: 'active', deviceHash, recovered: false })
+        };
     }
     
     // ---- POST /api/revoke ----
@@ -286,6 +291,11 @@ exports.handler = async (event, context) => {
         }
         
         const bindData = parseBindData(raw);
+        if (!bindData) {
+            // bind 记录损坏：直接清理该卡密的所有索引，避免残留可被 /check 命中
+            await redisDel(`bind:${cleaned}`);
+            return { statusCode: 200, headers, body: JSON.stringify({ code: 200, message: '卡密已解绑，可在新设备上重新激活' }) };
+        }
         
         // 删除 device 索引
         if (bindData.deviceHash) await redisDel(`device:${bindData.deviceHash}`);
